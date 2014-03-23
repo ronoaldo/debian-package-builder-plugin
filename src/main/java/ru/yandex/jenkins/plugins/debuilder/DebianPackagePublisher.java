@@ -1,5 +1,6 @@
 package ru.yandex.jenkins.plugins.debuilder;
 
+import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
@@ -10,6 +11,7 @@ import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.Descriptor;
 import hudson.model.Project;
+import hudson.plugins.git.GitSCM;
 import hudson.scm.SCM;
 import hudson.scm.SubversionSCM;
 import hudson.tasks.BuildStepDescriptor;
@@ -160,13 +162,13 @@ public class DebianPackagePublisher extends Recorder implements Serializable {
 
 			boolean wereBuilds = false;
 
-			for (String moduleLocation: DebianPackageBuilder.getAllModules(build)) {
-				if (! builtModules.contains(moduleLocation)) {
-					runner.announce("Module {0} was not built - not releasing", moduleLocation);
+			for (String module: DebianPackageBuilder.getRemoteModules(build)) {
+				if (! builtModules.contains(new FilePath(build.getWorkspace().getChannel(), module).child("debian").getRemote())) {
+					runner.announce("Module in {0} was not built - not releasing", module);
 					continue;
 				}
 
-				if (!runner.runCommandForResult("cd ''{0}'' && debrelease", build.getWorkspace().child(moduleLocation).getRemote())) {
+				if (!runner.runCommandForResult("cd ''{0}'' && debrelease", module)) {
 					throw new DebianizingException("Debrelease failed");
 				}
 
@@ -174,7 +176,8 @@ public class DebianPackagePublisher extends Recorder implements Serializable {
 			}
 
 			if (wereBuilds && commitChanges) {
-				commitChanges(build, runner);
+				String expandedCommitMessage = getExpandedCommitMessage(build, listener);
+				commitChanges(build, runner, expandedCommitMessage);
 			}
 		} catch (InterruptedException e) {
 			logger.println(MessageFormat.format(DebianPackageBuilder.ABORT_MESSAGE, PREFIX, e.getMessage()));
@@ -187,24 +190,47 @@ public class DebianPackagePublisher extends Recorder implements Serializable {
 		return true;
 	}
 
-	private void commitChanges(AbstractBuild<?, ?> build, Runner runner) throws DebianizingException {
+	private String getExpandedCommitMessage(AbstractBuild<?, ?> build, BuildListener listener) throws IOException, InterruptedException {
+		EnvVars env = build.getEnvironment(listener);
+		return env.expand(getCommitMessage());
+	}
+
+	private void commitChanges(AbstractBuild<?, ?> build, Runner runner, String commitMessage) throws DebianizingException, IOException, InterruptedException {
 		SCM scm = build.getProject().getScm();
 
-		if (!(scm instanceof SubversionSCM)) {
-			throw new DebianizingException("SCM used is not a subversion SCM but " + scm.getType());
+		if (scm instanceof SubversionSCM) {
+			commitToSVN(build, runner, (SubversionSCM)scm, commitMessage);
+		} else if (scm instanceof GitSCM) {
+			commitToGitAndPush(build, runner, (GitSCM)scm, commitMessage);
 		} else {
-			commitToSVN(build, runner, (SubversionSCM)scm);
+			throw new DebianizingException("SCM used is not a know one but " + scm.getType());
 		}
 	}
 
-	private void commitToSVN(final AbstractBuild<?, ?> build, final Runner runner, SubversionSCM svn) throws DebianizingException {
+	private void commitToGitAndPush(final AbstractBuild<?, ?> build, final Runner runner, GitSCM scm, String commitMessage) throws DebianizingException {
+		try {
+			GitCommitHelper helper = new GitCommitHelper(build, scm, runner, commitMessage, DebianPackageBuilder.getRemoteModules(build));
+
+			if (build.getWorkspace().act(helper)) {
+				runner.announce("Successfully commited to git");
+			} else {
+				throw new DebianizingException("Failed to commit to git");
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
+	}
+
+	private void commitToSVN(final AbstractBuild<?, ?> build, final Runner runner, SubversionSCM svn, String commitMessage) throws DebianizingException {
 		hudson.scm.SubversionSCM.DescriptorImpl descriptor = (hudson.scm.SubversionSCM.DescriptorImpl) Jenkins.getInstance().getDescriptor(hudson.scm.SubversionSCM.class);
 		ISVNAuthenticationProvider authenticationProvider = descriptor.createAuthenticationProvider(build.getProject());
 
 		try {
-			for (String module: DebianPackageBuilder.getAllModules(build)) {
-				SVNCommitHelper helper = new SVNCommitHelper(authenticationProvider, build.getWorkspace().child(module).getRemote(), getCommitMessage());
-				runner.announce("Commited revision <{0}> of <{2}> with message <{1}>", runner.getChannel().call(helper), getCommitMessage(), module);
+			for (String module: DebianPackageBuilder.getRemoteModules(build)) {
+				SVNCommitHelper helper = new SVNCommitHelper(authenticationProvider, module, commitMessage);
+				runner.announce("Commited revision <{0}> of <{2}> with message <{1}>", runner.getChannel().call(helper), commitMessage, module);
 			}
 		} catch (IOException e) {
 			e.printStackTrace();
